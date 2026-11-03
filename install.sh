@@ -78,14 +78,33 @@ install_all() {
     systemctl --user enable --now clipcatd
 
     say "== 启用扩展 =="
-    gnome-extensions enable caretlocator@local 2>/dev/null \
-        || say "  扩展已写入，但需要在下次登录后启用（shell 有 ESM 模块缓存）"
+    # 首次安装时 Shell 还没扫描到这个新扩展，这条命令通常无效但不报错，
+    # 所以下面把必须手动做的事明确打印出来。
+    gnome-extensions enable caretlocator@local 2>/dev/null || true
 
     say ""
-    say "完成。"
-    say "  面板      : Super+V（需在 GNOME 设置里绑定到 ${BIN_DIR}/clipcat-winui）"
-    say "  守护进程  : systemctl --user status clipcatd"
-    say "  扩展      : 首次安装需注销重新登录才生效"
+    say "完成。还需要以下手动步骤："
+    say ""
+    say "  1) 装扩展管理器（若未安装）"
+    say "       sudo apt install gnome-shell-extension-manager"
+    say ""
+    say "  2) 注销并重新登录"
+    say "       GNOME Shell 有 ESM 模块缓存，扩展无法热重载"
+    say "       Wayland 下也没有 Alt+F2 -> r，只能注销"
+    say ""
+    say "  3) 重新登录后打开 Extension Manager -> Installed"
+    say "       找到 Caret Locator，手动把开关打开"
+    say "       （脚本里的 gnome-extensions enable 首次安装往往无效）"
+    say ""
+    say "  4) 设置 -> 键盘 -> 自定义快捷键"
+    say "       把 Super+V 绑到 ${BIN_DIR}/clipcat-winui"
+    say ""
+    say "  验证扩展是否真的加载："
+    say "    gdbus call --session --dest org.gnome.Shell \\"
+    say "      --object-path /io/github/clipcat/CaretLocator \\"
+    say "      --method io.github.clipcat.CaretLocator.GetDebug"
+    say ""
+    say "  守护进程状态: systemctl --user status clipcatd"
 }
 
 case "${1:-}" in

@@ -31,9 +31,46 @@ sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 xdotool x11-utils
 ./install.sh
 ```
 
-然后注销重新登录（GNOME Shell 有 ESM 模块缓存，扩展无法热重载），
-最后在 **设置 → 键盘 → 自定义快捷键** 里把 `Super+V` 绑到
-`~/.local/bin/clipcat-winui`。
+### 1. 安装扩展管理器
+
+面板的指针定位依赖一个 GNOME Shell 扩展，而**启用扩展需要图形界面的扩展管理器**
+（`gnome-extensions enable` 命令在扩展还没被 Shell 认可时经常静默失败）：
+
+```sh
+sudo apt install gnome-shell-extension-manager
+```
+
+装完在应用列表里叫 **Extension Manager**，命令行是 `extension-manager`。
+
+### 2. 注销并重新登录
+
+GNOME Shell 有 ESM 模块缓存，`gnome-extensions disable/enable` 和
+`gnome-extensions reset` **都不会**重新读取 `extension.js`，只有重新登录才会加载。
+
+Wayland 会话下也没有 `Alt+F2` → `r` 这种重启方式，只能注销再登录。
+
+### 3. 在 Extension Manager 里手动启用
+
+重新登录后打开 **Extension Manager**，在 **Installed**（已安装）里找到
+**Caret Locator**，把开关打开。
+
+> 这一步不能省。`install.sh` 里的 `gnome-extensions enable` 只是尽力而为——
+> 首次安装时 Shell 还没扫描到这个新扩展，命令往往无效，但不会报错。
+
+启用后可以这样确认它真的在跑：
+
+```sh
+gdbus call --session --dest org.gnome.Shell \
+  --object-path /io/github/clipcat/CaretLocator \
+  --method io.github.clipcat.CaretLocator.GetDebug
+```
+
+有返回（形如 `updates=… pointer=(x,y) …`）就说明扩展已加载。
+如果报 `UnknownMethod` 或 `NameHasNoOwner`，说明扩展没启用。
+
+### 4. 绑定快捷键
+
+**设置 → 键盘 → 自定义快捷键**，把 `Super+V` 绑到 `~/.local/bin/clipcat-winui`。
 
 > 注意：GNOME 默认把 `<Super>v` 分配给了 `toggle-message-tray`。
 > 先让它让位，否则自定义快捷键会静默失效：
