@@ -1,0 +1,42 @@
+# clipcatd — GNOME 50 / mutter 18 环境
+# mutter 不提供 zwlr_data_control，Wayland 后端无法监听剪贴板，
+# 因此固定走 X11 后端（Xwayland 已把 Wayland 应用的剪贴板双向桥接到 X11）。
+daemonize = false
+max_history = 300
+primary_threshold_ms = 5000
+clear_history_on_start = false
+synchronize_selection_with_clipboard = true
+history_file_path = "~/.cache/clipcat/clipcatd-history"
+
+[log]
+emit_journald = true
+emit_stdout = false
+emit_stderr = false
+level = "INFO"
+
+[watcher]
+enable_clipboard = true
+# primary 是鼠标选中的选区，GNOME 下噪音很大，关掉
+enable_primary = false
+enable_secondary = false
+capture_image = true
+filter_image_max_size = 5242880
+filter_text_min_length = 1
+filter_text_max_length = 20000000
+denied_text_regex_patterns = []
+sensitive_mime_types = ["x-kde-passwordManagerHint"]
+
+[grpc]
+enable_http = true
+enable_local_socket = true
+host = "127.0.0.1"
+port = 45045
+
+[dbus]
+enable = true
+
+[metrics]
+enable = false
+
+[desktop_notification]
+enable = false

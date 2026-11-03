@@ -1,0 +1,10 @@
+#!/bin/sh
+# Win+V 风格剪贴板面板启动器。
+#
+# 必须跑在 Xwayland 上（GDK_BACKEND=x11）：
+#   Wayland 不提供任何让应用给自己窗口定位的 API，
+#   走 Xwayland 后才能用 xdotool windowmove 精确控制位置。
+# 指针坐标由 GNOME Shell 扩展 caretlocator@local 通过 D-Bus 提供。
+export GDK_BACKEND=x11
+export DISPLAY="${DISPLAY:-:0}"
+exec /usr/bin/python3 "@PANEL_DIR@/clipcat-winui.py" "$@"

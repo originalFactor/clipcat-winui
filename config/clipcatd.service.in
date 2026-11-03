@@ -1,0 +1,19 @@
+[Unit]
+Description=Clipcat clipboard manager daemon
+Documentation=https://github.com/xrelkd/clipcat
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# clipcat 的 Wayland 后端需要一个 mutter 不提供的协议（zwlr_data_control），
+# 所以固定走 X11 后端。Xwayland 会把 Wayland 应用的剪贴板双向桥接到 X11。
+Environment=DISPLAY=:0
+Environment=XDG_SESSION_TYPE=x11
+UnsetEnvironment=WAYLAND_DISPLAY
+ExecStart=@BIN_DIR@/clipcatd --no-daemon --config @CONFIG_DIR@/clipcatd.toml
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target

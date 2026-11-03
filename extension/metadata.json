@@ -1,0 +1,7 @@
+{
+  "uuid": "caretlocator@local",
+  "name": "Caret Locator",
+  "description": "Expose text caret / pointer position to the clipcat panel",
+  "shell-version": ["50"],
+  "version": 1
+}
