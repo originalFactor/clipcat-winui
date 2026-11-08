@@ -3,7 +3,7 @@
 
 数据源：clipcatd 的 D-Bus 接口 org.clipcat.clipcat.Manager
   - List(preview_length) -> a(tsuxs)   id, mime, kind, timestamp, preview
-  - Get(id)              -> (tayusx)   id, bytes, mime, kind, timestamp
+  - Get(id)              -> (tayusx)   id, bytes, kind, mime, timestamp
   - Mark(id, kind)       -> 把某条写回剪贴板
   - Remove(id)           -> 删除
 
@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import OrderedDict
 
 import gi
 
@@ -316,6 +317,7 @@ MAX_VISUAL_LINES = 5
 MIN_COLS = 1
 MAX_COLS = 5
 THUMB_MAX = 72
+THUMB_CACHE_SIZE = 48
 PREVIEW_LEN = 400
 
 
@@ -350,13 +352,22 @@ class ClipcatClient:
             clips.append(r)
         return clips
 
-    def get(self, clip_id):
-        # D-Bus 结构是 (tayusx)，即 (id, data, kind, mime, timestamp)：
-        # kind 是 u，排在 mime 的 s 前面，别按 proto 里的字段顺序想当然。
-        res = self._call("Get", GLib.Variant("(t)", (clip_id,)),
-                         GLib.VariantType("(tayusx)"))
-        cid, data, kind, mime, ts = res.unpack()
-        return {"id": cid, "data": bytes(data), "mime": mime, "kind": kind, "ts": ts}
+    def get_data(self, clip_id, cancellable, callback):
+        def on_reply(bus, result, _user_data):
+            try:
+                reply = bus.call_finish(result)
+                # Get 返回 (id, data, kind, mime, timestamp)。直接取 ay，
+                # 避免 unpack() 逐字节构造 Python 整数列表。
+                data = reply.get_child_value(1).get_data_as_bytes()
+            except GLib.Error:
+                data = None
+            callback(data)
+
+        self.bus.call(
+            BUS_NAME, OBJ_PATH, IFACE, "Get", GLib.Variant("(t)", (clip_id,)),
+            GLib.VariantType("(tayusx)"), Gio.DBusCallFlags.NONE,
+            4000, cancellable, on_reply, None,
+        )
 
     def mark(self, clip_id):
         self._call("Mark", GLib.Variant("(tu)", (clip_id, 0)),
@@ -400,12 +411,13 @@ def _wrap_lines(text, width_px, pango_ctx=None, font_size_pt=11.0):
             out_lines.append("")
         else:
             layout.set_text(raw, -1)
-            total = len(raw)
+            # Pango 的行位置按 UTF-8 字节计算。
+            encoded = raw.encode("utf-8")
             for i in range(layout.get_line_count()):
-                line = layout.get_line(i)
-                begin = min(line.start_index, total)
-                finish = min(begin + line.length, total)
-                out_lines.append(raw[begin:finish])
+                line = layout.get_line_readonly(i)
+                begin = line.start_index
+                finish = begin + line.length
+                out_lines.append(encoded[begin:finish].decode("utf-8"))
         if len(out_lines) >= MAX_VISUAL_LINES:
             # 这一条源行还没处理完，或者后面还有源行没轮到，都算截断
             consumed_all = (idx == len(sources) - 1) and len(out_lines) <= MAX_VISUAL_LINES
@@ -416,15 +428,16 @@ def _wrap_lines(text, width_px, pango_ctx=None, font_size_pt=11.0):
 
 def trim_preview(text, width_px=188, pango_ctx=None, font_size_pt=11.0):
     """按可用宽度折行并限制行数；只有真的超出才加省略号。"""
-    text = text.rstrip()
+    clipped = len(text) > PREVIEW_LEN
+    text = text[:PREVIEW_LEN].rstrip()
     if not text:
-        return ""
+        return "…" if clipped else ""
     lines, truncated = _wrap_lines(text, width_px, pango_ctx, font_size_pt)
     shown = "\n".join(lines)
     if len(shown) > TEXT_MAX_CHARS:
         shown = shown[:TEXT_MAX_CHARS].rstrip()
         truncated = True
-    if truncated:
+    if truncated or clipped:
         shown = shown.rstrip() + "…"
     return shown
 
@@ -464,8 +477,11 @@ class ClipCard(Gtk.Button):
         self.clip_id = clip_id
         self.mime = mime
         self.preview = preview
-        # 完整正文（Get 拿到真实字节后填这里），宽度变化时用它重新折行
-        self.full_text = preview
+        # List 会转义换行、回车和制表符，但保留原文的反斜杠。
+        self.needs_preview = mime == "image/png" or any(
+            token in preview for token in (r"\n", r"\r", r"\t")
+        )
+        self._text_preview = preview
         self._text_width = 0
         self.timestamp = timestamp
         self.on_activate = on_activate
@@ -532,7 +548,7 @@ class ClipCard(Gtk.Button):
         self._text_width = width
         label = self.stack.get_child_by_name("text")
         if label is not None:
-            label.set_text(trim_preview(self.full_text, width,
+            label.set_text(trim_preview(self._text_preview, width,
                                         self.get_pango_context()))
 
     def footer_text(self):
@@ -581,40 +597,33 @@ class ClipCard(Gtk.Button):
         self.stack.add_named(pic, "image")
         self._thumb = pic
 
-    def set_real_text(self, text):
-        """用 Get 拿到的真实字节覆盖正文，修掉 preview 里字面 \\n 的问题。"""
-        if self.mime == "image/png":
-            return
+    def set_text_preview(self, text):
+        """用原文的短前缀保留换行和制表符。"""
         label = self.stack.get_child_by_name("text")
-        if label is None:
-            return
-        self.full_text = text
+        self._text_preview = text
         label.set_text(trim_preview(text, self._text_area_width(),
                                     self.get_pango_context()))
 
-    def load_thumbnail(self, data):
-        """把图片字节交给 Gtk.Picture，缩放由控件自己按可用空间处理。"""
-        if self.mime != "image/png":
-            return
-        try:
-            loader = GdkPixbuf.PixbufLoader.new_with_type("png")
-            loader.write(data)
-            loader.close()
-            pix = loader.get_pixbuf()
-            if pix is None:
-                raise ValueError("no pixbuf")
-            # 先降到合理分辨率，避免超大图每次重绘都全尺寸缩放
-            w, h = pix.get_width(), pix.get_height()
-            if max(w, h) > 512:
-                scale = 512 / max(w, h)
-                pix = pix.scale_simple(max(1, int(w * scale)),
-                                       max(1, int(h * scale)),
-                                       GdkPixbuf.InterpType.BILINEAR)
-            texture = Gdk.Texture.new_for_pixbuf(pix)
-            self._thumb.set_paintable(texture)
-        except Exception:
-            # 解码失败就什么都不放，字号脚注仍会显示「图片」
-            self._thumb.set_paintable(None)
+    def set_thumbnail(self, pix):
+        """限制纹理尺寸，避免绘制时重复缩放全尺寸图片。"""
+        w, h = pix.get_width(), pix.get_height()
+        if max(w, h) > 512:
+            scale = 512 / max(w, h)
+            pix = pix.scale_simple(max(1, int(w * scale)),
+                                   max(1, int(h * scale)),
+                                   GdkPixbuf.InterpType.BILINEAR)
+        if pix is None:
+            return False
+        self._thumb.set_paintable(Gdk.Texture.new_for_pixbuf(pix))
+        return True
+
+    def evict_thumbnail(self):
+        texture = self._thumb.get_paintable()
+        # 保留图片尺寸，释放像素时行高和滚动位置不变。
+        self._thumb.set_paintable(Gdk.Paintable.new_empty(
+            texture.get_intrinsic_width(), texture.get_intrinsic_height(),
+        ))
+        self.needs_preview = True
 
     def _on_key(self, controller, keyval, keycode, state):
         if keyval == Gdk.KEY_Delete:
@@ -629,7 +638,9 @@ class ClipboardWindow(Gtk.ApplicationWindow):
         self.client = client
         self.cards = []
         self.selected = 0
-        self._thumb_pending = []
+        self._preview_update_id = 0
+        self._preview_request = None
+        self._thumbnail_cache = OrderedDict()
 
         self.set_title("剪贴板历史")
         # 恢复上次的窗口尺寸
@@ -700,6 +711,10 @@ class ClipboardWindow(Gtk.ApplicationWindow):
         self.grid.set_margin_end(16)
         self.scroller.set_child(self.grid)
         self._rows = []
+        adjustment = self.scroller.get_vadjustment()
+        adjustment.connect("value-changed", self._queue_preview_update)
+        adjustment.connect("changed", self._queue_preview_update)
+        self.scroller.connect("map", self._queue_preview_update)
 
         self.set_child(root)
 
@@ -781,6 +796,7 @@ class ClipboardWindow(Gtk.ApplicationWindow):
         return False
 
     def _on_close_request(self, *_args):
+        self._stop_preview_load()
         if getattr(self, "_size_timer", 0):
             GLib.source_remove(self._size_timer)
             self._size_timer = 0
@@ -798,7 +814,6 @@ class ClipboardWindow(Gtk.ApplicationWindow):
             return
         cols = self._cols()
         if cols != self._last_cols:
-            self._last_cols = cols
             self._relayout()
 
     def _on_mapped(self, *_args):
@@ -869,6 +884,8 @@ class ClipboardWindow(Gtk.ApplicationWindow):
     # ---------- 数据加载 ----------
 
     def reload(self):
+        self._stop_preview_load()
+        self._thumbnail_cache.clear()
         # 清空旧的行与卡片
         child = self.grid.get_first_child()
         while child is not None:
@@ -878,7 +895,6 @@ class ClipboardWindow(Gtk.ApplicationWindow):
         self._rows = []
         self.cards = []
         self.selected = 0
-        self._thumb_pending = []
 
         try:
             clips = self.client.list()
@@ -889,13 +905,11 @@ class ClipboardWindow(Gtk.ApplicationWindow):
             card = ClipCard(clip_id, mime, preview, ts, self._activate, self._delete)
             card.connect("clicked", lambda _b, cid=clip_id: self._activate(cid))
             self.cards.append(card)
-            self._thumb_pending.append(card)
 
         self._relayout()
         self.count_label.set_text(f"{len(self.cards)} 项" if self.cards else "暂无记录")
         if self.cards:
             self._set_selected(0)
-            GLib.idle_add(self._drain_thumbs)
 
     def _cols(self):
         """按当前可用宽度算列数：卡片至少 CARD_MIN_W 宽。"""
@@ -919,6 +933,7 @@ class ClipboardWindow(Gtk.ApplicationWindow):
             self._relayout_inner()
         finally:
             self._in_relayout = False
+        self._queue_preview_update()
 
     def _relayout_inner(self):
         visible = [c for c in self.cards if c.get_visible()]
@@ -931,32 +946,120 @@ class ClipboardWindow(Gtk.ApplicationWindow):
             child = nxt
         self._rows = []
 
-        if not visible:
-            return
-
         cols = self._cols()
+        self._last_cols = cols
         for i, card in enumerate(visible):
             card.set_hexpand(True)
             card.set_halign(Gtk.Align.FILL)
             card.set_valign(Gtk.Align.FILL)
             card.set_vexpand(True)
             self.grid.attach(card, i % cols, i // cols, 1, 1)
-        self._rows = [None] * ((len(visible) + cols - 1) // cols)
+        self._rows = [visible[i:i + cols] for i in range(0, len(visible), cols)]
 
-    def _drain_thumbs(self):
-        """逐个异步加载图片缩略图，一次事件循环处理一张。"""
-        if not self._thumb_pending:
-            return False
-        card = self._thumb_pending.pop(0)
-        try:
-            entry = self.client.get(card.clip_id)
+    def _queue_preview_update(self, *_args):
+        if not self._preview_update_id and self.scroller.get_mapped():
+            self._preview_update_id = GLib.idle_add(self._update_preview_load)
+
+    def _stop_preview_load(self):
+        if self._preview_update_id:
+            GLib.source_remove(self._preview_update_id)
+            self._preview_update_id = 0
+        if self._preview_request is not None:
+            _, cancellable = self._preview_request
+            self._preview_request = None
+            cancellable.cancel()
+
+    def _nearby_cards(self, top, page):
+        """返回当前页和前后各一页的卡片，可见行优先。"""
+        bottom = top + page
+        nearby_rows = []
+        for row in self._rows:
+            ok, bounds = row[0].compute_bounds(self.grid)
+            if not ok or bounds.size.height <= 0:
+                continue
+            row_top = bounds.origin.y
+            if row_top >= bottom + page:
+                break
+            row_bottom = row_top + bounds.size.height
+            outside = row_bottom <= top or row_top >= bottom
+            distance = max(top - row_bottom, row_top - bottom, 0)
+            if distance < page:
+                nearby_rows.append((outside, distance, row))
+        nearby_rows.sort(key=lambda entry: entry[:2])
+        return [card for _, _, row in nearby_rows for card in row]
+
+    def _update_preview_load(self):
+        self._preview_update_id = 0
+        adj = self.scroller.get_vadjustment()
+        page = adj.get_page_size()
+        if not self.scroller.get_mapped() or page <= 0:
+            return GLib.SOURCE_REMOVE
+
+        # GtkViewport 的滚动距离含 Grid 的上边距。
+        top = adj.get_value() - self.grid.get_margin_top()
+        nearby = self._nearby_cards(top, page)
+        image_count = 0
+        for card in nearby:
             if card.mime == "image/png":
-                card.load_thumbnail(entry["data"])
-            else:
-                card.set_real_text(entry["data"].decode("utf-8", "replace"))
+                image_count += 1
+                if card in self._thumbnail_cache:
+                    self._thumbnail_cache.move_to_end(card)
+        # 大窗口也保留当前页和预取区的所有缩略图，避免反复解码。
+        limit = max(THUMB_CACHE_SIZE, image_count)
+        while len(self._thumbnail_cache) > limit:
+            card, _ = self._thumbnail_cache.popitem(last=False)
+            card.evict_thumbnail()
+
+        if self._preview_request is not None:
+            card, cancellable = self._preview_request
+            if card not in nearby:
+                cancellable.cancel()
+        else:
+            card = next((card for card in nearby if card.needs_preview), None)
+            if card is not None:
+                self._load_preview(card)
+        return GLib.SOURCE_REMOVE
+
+    def _load_preview(self, card):
+        cancellable = Gio.Cancellable()
+        self._preview_request = (card, cancellable)
+
+        def on_data(data):
+            if cancellable.is_cancelled():
+                self._finish_preview(card, cancellable)
+                return
+            if data is not None and card.mime == "image/png":
+                stream = Gio.MemoryInputStream.new_from_bytes(data)
+                GdkPixbuf.Pixbuf.new_from_stream_async(
+                    stream, cancellable, self._on_thumbnail, (card, cancellable),
+                )
+                return
+            if data is not None:
+                # UTF-8 每字符最多 4 字节，多取一个字符供截断判断。
+                length = min(data.get_size(), PREVIEW_LEN * 4 + 1)
+                prefix = GLib.Bytes.new_from_bytes(data, 0, length).get_data()
+                card.set_text_preview(prefix.decode("utf-8", "replace")[:PREVIEW_LEN + 1])
+            self._finish_preview(card, cancellable)
+
+        self.client.get_data(card.clip_id, cancellable, on_data)
+
+    def _on_thumbnail(self, _stream, result, context):
+        card, cancellable = context
+        try:
+            pix = GdkPixbuf.Pixbuf.new_from_stream_finish(result)
         except GLib.Error:
-            pass
-        return bool(self._thumb_pending)
+            pix = None
+        if not cancellable.is_cancelled() and pix is not None and card.set_thumbnail(pix):
+            self._thumbnail_cache[card] = None
+        self._finish_preview(card, cancellable)
+
+    def _finish_preview(self, card, cancellable):
+        if self._preview_request != (card, cancellable):
+            return
+        self._preview_request = None
+        if not cancellable.is_cancelled():
+            card.needs_preview = False
+        self._queue_preview_update()
 
     # ---------- 交互 ----------
 
